@@ -1,0 +1,565 @@
+use std::collections::HashMap;
+use std::fmt::write;
+use std::fmt::Display;
+use std::io::stdout;
+use std::io::BufRead;
+use std::io::BufReader;
+use std::io::Write;
+use std::sync::mpsc;
+use std::sync::mpsc::Receiver;
+use std::thread;
+use std::time::Duration;
+
+use crossterm::cursor;
+use crossterm::event;
+use crossterm::style::Print;
+use crossterm::terminal::disable_raw_mode;
+use crossterm::terminal::enable_raw_mode;
+use crossterm::terminal::Clear;
+use crossterm::{terminal, QueueableCommand};
+use lazy_static::lazy_static;
+use portable_pty::unix::close_random_fds;
+use portable_pty::Child;
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+#[derive(Clone, Copy)]
+enum ArmType {
+    T0,
+    T1,
+    T2,
+    T3,
+}
+
+#[derive(Clone, Copy)]
+enum State {
+    Rest,
+    MoveUp,
+    Strike,
+    MoveDown,
+}
+
+#[derive(Clone, Copy)]
+struct Arm {
+    arm_type: ArmType,
+    state: State,
+}
+
+#[derive(Clone)]
+struct Draw {
+    c: char,
+    row_offset: i16,
+    col_offset: i16,
+}
+
+type Canvas = Vec<Vec<char>>;
+
+struct Typewriter {
+    height: u16,
+    width: u16,
+    mid: u16,
+    pub canvas: Canvas,
+    pub arms: Vec<Arm>,
+
+    buffer: String,
+
+    typewriter_upper: Vec<char>,
+    typewriter_upper_slants: Vec<char>,
+    typewriter_upper_bottom: Vec<char>,
+}
+
+impl Display for Typewriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for row in &*self.canvas {
+            for c in row {
+                write!(f, "{}", c)?;
+            }
+            write!(f, "{}", "\r\n")?;
+        }
+        Ok(())
+    }
+}
+
+const PRINT_ROW: usize = 0;
+const UPPER_ROW: usize = 1;
+const UPPER_SLANTS_ROW: usize = 2;
+const UPPER_BOTTOM_ROW: usize = 3;
+const TYPEARM_ROW: usize = 4;
+const KEY_ROW_1: usize = 5;
+const KEY_ROWS: usize = 4;
+const N_KEYS: usize = 46;
+const KEYS_PER_ROW: usize = N_KEYS / KEY_ROWS;
+
+const HORZ_UP: char = '⎺';
+const HORZ: char = '─';
+const VERT: char = '│';
+const SLANTR_1: char = '/';
+const SLANTR_2: char = '⟋';
+const SLANTR_3: &str = "⎽⎼⎻⎺";
+const SLANTR_3S: &str = "⎼⎻⎺";
+const SLANTL_1: char = '\\';
+const SLANTL_2: char = '⟍';
+const SLANTL_3: &str = "⎺⎻⎼⎽";
+const SLANTL_3S: &str = "⎺⎻⎼";
+const KEY_1: &str = "- - - - - - - - - - - -";
+const KEY_2: &str = " - - - - - - - - - - -";
+
+struct Key {
+    row: usize,
+    col: usize,
+    idx_in_row: usize,
+}
+
+#[rustfmt::skip]
+// TODO: support uppercase
+const QWERTY: [char; N_KEYS] = [
+    '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '+',
+    '\u{9}', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p','\u{8}',
+    'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '\n',
+    'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/',
+];
+
+lazy_static! {
+    static ref KEYMAPS: HashMap<char, Key> = HashMap::from_iter(
+        QWERTY
+            .into_iter()
+            .scan((KEY_ROW_1, 0), |(cur_row, idx), c| {
+                match c {
+                    '\u{9}' | 'a' | 'z' => {
+                        *cur_row += 1;
+                        *idx = 0;
+                        Some((*cur_row, *idx, c))
+                    }
+                    _ => {
+                        *idx += 1;
+                        Some((*cur_row, *idx, c))
+                    }
+                }
+            })
+            .map(|(row, idx, ch)| (
+                ch,
+                Key {
+                    row,
+                    col: idx * 2 + 1,
+                    idx_in_row: idx,
+                }
+            ))
+    );
+}
+
+const TYPEWRITER_HEIGHT: u16 = 10;
+const TYPEWRITER_MAX_WIDTH: u16 = 51;
+
+impl Typewriter {
+    pub fn new(height: u16, width: u16) -> Box<Typewriter> {
+        let typewriter_upper_width = 43;
+        let mut typewriter_upper = vec![' '; width.into()];
+        let upper_space = (TYPEWRITER_MAX_WIDTH - typewriter_upper_width) / 2;
+        for i in 1..typewriter_upper_width {
+            typewriter_upper[(upper_space + i) as usize] = HORZ;
+        }
+
+        let mut typewriter_upper_slants = vec![' '; width.into()];
+        SLANTR_3
+            .chars()
+            .enumerate()
+            .for_each(|(i, c)| typewriter_upper_slants[i] = c);
+        SLANTR_3
+            .chars()
+            .enumerate()
+            .for_each(|(i, c)| typewriter_upper_slants[width as usize - 1 - i] = c);
+
+        let mut typewriter_upper_bottom = vec![HORZ; width.into()];
+        let upper_bottom_space = 2;
+        SLANTL_3S
+            .chars()
+            .enumerate()
+            .for_each(|(i, c)| typewriter_upper_bottom[upper_bottom_space + i] = c);
+        SLANTL_3S.chars().enumerate().for_each(|(i, c)| {
+            typewriter_upper_bottom[width as usize - upper_bottom_space - 1 - i] = c
+        });
+
+        let mut canvas = vec![vec![' '; width.into()]; height.into()];
+
+        let mut arms = Vec::new();
+        let mid = width / 2;
+        let n_arms = width / 2;
+        let mid_arm = n_arms / 2;
+        for i in 0..n_arms {
+            arms.push(Arm {
+                arm_type: if i == mid_arm {
+                    ArmType::T0
+                } else if i < mid_arm / 2 || i > mid_arm + mid_arm / 2 {
+                    ArmType::T2
+                } else {
+                    ArmType::T1
+                },
+                state: State::Rest,
+            });
+        }
+        let spacing: usize = ((width - n_arms) / 2).into();
+        SLANTR_3S
+            .chars()
+            .enumerate()
+            .for_each(|(i, c)| canvas[TYPEARM_ROW][spacing - i - 1] = c);
+        SLANTR_3S
+            .chars()
+            .enumerate()
+            .for_each(|(i, c)| canvas[TYPEARM_ROW][width as usize - spacing + 1 + i] = c);
+
+        let key_start = (width as usize - KEY_1.chars().count()) / 2;
+        KEY_1
+            .chars()
+            .enumerate()
+            .for_each(|(i, c)| canvas[KEY_ROW_1][key_start + i] = c);
+        KEY_2
+            .chars()
+            .enumerate()
+            .for_each(|(i, c)| canvas[KEY_ROW_1 + 1][key_start + i] = c);
+        KEY_1
+            .chars()
+            .enumerate()
+            .for_each(|(i, c)| canvas[KEY_ROW_1 + 2][key_start + i] = c);
+        KEY_2
+            .chars()
+            .enumerate()
+            .for_each(|(i, c)| canvas[KEY_ROW_1 + 3][key_start + i] = c);
+
+        return Box::new(Typewriter {
+            height,
+            width,
+            canvas,
+            arms,
+            mid,
+            typewriter_upper,
+            typewriter_upper_slants,
+            typewriter_upper_bottom,
+            buffer: String::new(),
+        });
+    }
+
+    pub fn update_state(&mut self, key: char) {
+        if let Some(pos) = self.get_key_pos(key) {
+            self.buffer.push(key);
+            self.arms[pos].state = State::MoveUp;
+        }
+    }
+
+    pub fn refresh(&mut self) -> Result<(), anyhow::Error> {
+        self.canvas[0].fill(' ');
+        let mut input = self.buffer.chars();
+        let print_pos = self.mid as usize - self.buffer.len();
+        for (i, cell) in self.canvas[0].iter_mut().enumerate() {
+            if i >= print_pos {
+                if let Some(t) = &input.next() {
+                    *cell = t.clone();
+                }
+            }
+        }
+        self.canvas[UPPER_ROW].copy_from_slice(&self.typewriter_upper);
+        self.canvas[UPPER_SLANTS_ROW].copy_from_slice(&self.typewriter_upper_slants);
+        self.canvas[UPPER_BOTTOM_ROW].copy_from_slice(&self.typewriter_upper_bottom);
+        self.draw_arms();
+        let mut stdout = stdout();
+        stdout.queue(Clear(terminal::ClearType::FromCursorDown))?;
+        stdout.queue(Print(&self))?;
+        stdout.queue(cursor::MoveUp(self.height))?;
+        stdout.flush()?;
+        Ok(())
+    }
+
+    fn get_key_pos(&self, key: char) -> Option<usize> {
+        if let Some(k) = KEYMAPS.get(&key) {
+            let spacing = self.width as usize / 2 - KEYS_PER_ROW;
+            let mid_arm = self.arms.len() / 2;
+            let lerp = self.arms.len() as f32 / N_KEYS as f32;
+            let pos = if k.col + spacing > self.mid.into() {
+                mid_arm
+                    + (lerp
+                        * (k.idx_in_row.abs_diff(KEYS_PER_ROW / 2)) as f32
+                        * (k.row - KEY_ROW_1 + 1) as f32)
+                        .round() as usize
+            } else {
+                mid_arm
+                    - (lerp
+                        * (k.idx_in_row.abs_diff(KEYS_PER_ROW / 2)) as f32
+                        * (k.row - KEY_ROW_1 + 1) as f32)
+                        .round() as usize
+            };
+            return Some(pos);
+        }
+        None
+    }
+
+    pub fn draw_arms(&mut self) {
+        let mid_arm = self.arms.len() / 2;
+        let spacing = (self.width - self.arms.len() as u16) / 2;
+        for (i, arm) in self.arms.iter_mut().enumerate() {
+            let flip = if i < mid_arm { 0 } else { 1 };
+            let cmds = Self::draw_arm(&arm, flip != 0, i as u16, mid_arm as u16);
+            for cmd in cmds {
+                self.canvas[usize::try_from(TYPEARM_ROW as i16 + cmd.row_offset).unwrap()]
+                    [usize::try_from((spacing as i16 + i as i16) + cmd.col_offset).unwrap()] =
+                    cmd.c;
+            }
+            arm.state = match arm.state {
+                State::Rest => State::Rest,
+                State::MoveUp => State::Strike,
+                State::Strike => State::MoveDown,
+                // _ => arm.state,
+                State::MoveDown => State::Rest,
+            }
+        }
+    }
+
+    fn draw_arm(arm: &Arm, flip: bool, start: u16, mid: u16) -> Vec<Draw> {
+        let diff = mid.abs_diff(start);
+        match arm.arm_type {
+            ArmType::T0 => match arm.state {
+                State::Rest => vec![
+                    Draw {
+                        c: VERT,
+                        row_offset: 0,
+                        col_offset: 0,
+                    },
+                    Draw {
+                        c: VERT,
+                        row_offset: 1,
+                        col_offset: 0,
+                    },
+                ],
+                State::MoveUp | State::MoveDown => vec![
+                    Draw {
+                        c: VERT,
+                        row_offset: 0,
+                        col_offset: 0,
+                    },
+                    Draw {
+                        c: '_',
+                        row_offset: -1,
+                        col_offset: 0,
+                    },
+                ],
+                State::Strike => Self::generate_strike_arm(arm.arm_type, flip, diff),
+            },
+            ArmType::T1 => match arm.state {
+                State::Rest => vec![
+                    Draw {
+                        c: if flip { SLANTL_1 } else { SLANTR_1 },
+                        row_offset: 0,
+                        col_offset: 0,
+                    },
+                    Draw {
+                        c: if flip { SLANTL_1 } else { SLANTR_1 },
+                        row_offset: 1,
+                        col_offset: if flip { 1 } else { -1 },
+                    },
+                ],
+                State::MoveUp | State::MoveDown => vec![
+                    Draw {
+                        c: if flip { SLANTR_2 } else { SLANTL_2 },
+                        row_offset: 0,
+                        col_offset: 0,
+                    },
+                    Draw {
+                        c: if flip { SLANTR_2 } else { SLANTL_2 },
+                        row_offset: -1,
+                        col_offset: if flip { 1 } else { -1 },
+                    },
+                ],
+                State::Strike => Self::generate_strike_arm(arm.arm_type, flip, diff),
+            },
+            ArmType::T2 => match arm.state {
+                State::Rest => vec![
+                    Draw {
+                        c: if flip { SLANTL_2 } else { SLANTR_2 },
+                        row_offset: 0,
+                        col_offset: 0,
+                    },
+                    Draw {
+                        c: if flip { SLANTL_2 } else { SLANTR_2 },
+                        row_offset: 1,
+                        col_offset: if flip { 1 } else { -1 },
+                    },
+                ],
+                State::MoveUp | State::MoveDown => vec![
+                    Draw {
+                        c: if flip { SLANTR_2 } else { SLANTL_2 },
+                        row_offset: 0,
+                        col_offset: 0,
+                    },
+                    Draw {
+                        c: if flip { SLANTR_2 } else { SLANTL_2 },
+                        row_offset: -1,
+                        col_offset: if flip { 1 } else { -1 },
+                    },
+                ],
+                State::Strike => Self::generate_strike_arm(arm.arm_type, flip, diff),
+            },
+            ArmType::T3 => todo!(),
+        }
+    }
+
+    fn generate_strike_arm(arm_type: ArmType, flip: bool, horz_dist: u16) -> Vec<Draw> {
+        let mut cmds = vec![Draw {
+            c: VERT,
+            row_offset: -1,
+            col_offset: 0,
+        }];
+        let vert_dist = 2;
+        match arm_type {
+            ArmType::T0 => {
+                for i in 0..vert_dist {
+                    cmds.push(Draw {
+                        c: VERT,
+                        row_offset: -(2 + i),
+                        col_offset: 0,
+                    })
+                }
+            }
+            ArmType::T1 => {
+                for i in 0..vert_dist {
+                    cmds.push(Draw {
+                        c: if flip { SLANTL_1 } else { SLANTR_1 },
+                        row_offset: -(2 + i),
+                        col_offset: if flip { -i } else { i },
+                    });
+                }
+                for i in 2 as i16..horz_dist.try_into().unwrap() {
+                    cmds.push(Draw {
+                        c: HORZ_UP,
+                        row_offset: -3,
+                        col_offset: if flip { -i } else { i },
+                    })
+                }
+            }
+            ArmType::T2 => {
+                for i in 0..vert_dist {
+                    cmds.push(Draw {
+                        c: if flip { SLANTL_2 } else { SLANTR_2 },
+                        row_offset: -(2 + i),
+                        col_offset: if flip { -(i * 2 + 1) } else { i * 2 + 1 },
+                    });
+                }
+                for i in 5 as i16..horz_dist.try_into().unwrap() {
+                    cmds.push(Draw {
+                        c: HORZ_UP,
+                        row_offset: -3,
+                        col_offset: if flip { -i } else { i },
+                    })
+                }
+            }
+            ArmType::T3 => todo!(),
+        };
+        cmds.push(Draw {
+            c: VERT,
+            row_offset: -4,
+            col_offset: if flip {
+                -(horz_dist as i16)
+            } else {
+                horz_dist as i16
+            },
+        });
+        return cmds;
+    }
+}
+
+fn main() -> Result<(), anyhow::Error> {
+    // Use the native pty implementation for the system
+    let pty_system = native_pty_system();
+
+    let mut typewriter = Typewriter::new(TYPEWRITER_HEIGHT, TYPEWRITER_MAX_WIDTH);
+
+    typewriter.draw_arms();
+
+    let window_size = terminal::window_size()?;
+    let mut stdout = stdout();
+    stdout.queue(cursor::MoveToNextLine(1))?;
+    typewriter.refresh()?;
+    stdout.flush()?;
+
+    // Create a new pty
+    let pair = pty_system.openpty(PtySize {
+        rows: window_size.rows,
+        cols: window_size.columns,
+        pixel_width: window_size.width,
+        pixel_height: window_size.height,
+    })?;
+
+    // Spawn a shell into the pty
+    let cmd = CommandBuilder::new("bash");
+    let mut child = pair.slave.spawn_command(cmd)?;
+
+    // Read and parse output from the pty with reader
+    let reader = BufReader::new(pair.master.try_clone_reader()?);
+
+    // Send data to the pty by writing to the master
+    let mut writer = pair.master.take_writer()?;
+    // writeln!(writer, "ls -l\n")?;
+    // writer.flush()?;
+    let rx = spawn_pty_channel(reader);
+    enable_raw_mode()?;
+    loop {
+        if event::poll(Duration::from_millis(33))? {
+            match event::read()? {
+                event::Event::Key(e) => match e.code {
+                    event::KeyCode::Backspace => todo!(),
+                    event::KeyCode::Enter => todo!(),
+                    event::KeyCode::Tab => todo!(),
+                    event::KeyCode::Char(c) => {
+                        if c == 'c' && e.modifiers.contains(event::KeyModifiers::CONTROL) {
+                            break;
+                        }
+                        typewriter.update_state(c);
+                    }
+                    event::KeyCode::Esc => todo!(),
+                    event::KeyCode::CapsLock => todo!(),
+                    event::KeyCode::Modifier(_) => todo!(),
+                    _ => continue,
+                },
+                _ => todo!(),
+            };
+        }
+        typewriter.refresh()?;
+        // match rx.try_recv() {
+        //     Ok(s) => std::io::stdout().write_all(&s)?,
+        //     Err(mpsc::TryRecvError::Empty) => thread::sleep(Duration::from_millis(100)),
+        //     Err(mpsc::TryRecvError::Disconnected) => {
+        //         break;
+        //     }
+        // }
+    }
+    cleanup(child);
+    Ok(())
+}
+
+fn cleanup(mut child: Box<dyn Child + Send + Sync>) {
+    let _ = child.kill();
+    close_random_fds();
+    let _ = disable_raw_mode();
+}
+
+fn spawn_pty_channel(mut reader: impl BufRead + std::marker::Send + 'static) -> Receiver<[u8; 1]> {
+    let (tx, rx) = mpsc::channel::<[u8; 1]>();
+    thread::spawn(move || loop {
+        let mut buffer = [0; 1];
+        if let Err(_) = reader.read_exact(&mut buffer) {
+            break;
+        };
+        tx.send(buffer).unwrap();
+    });
+    rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_pos() {
+        let t = Typewriter::new(TYPEWRITER_HEIGHT, TYPEWRITER_MAX_WIDTH);
+        assert_eq!(25, t.arms.len());
+        assert_eq!(Some(10), t.get_key_pos('1'));
+        assert_eq!(Some(15), t.get_key_pos('0'));
+        assert_eq!(Some(0), t.get_key_pos('z'));
+    }
+}
