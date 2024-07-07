@@ -84,10 +84,13 @@ const UPPER_ROW: usize = 1;
 const UPPER_SLANTS_ROW: usize = 2;
 const UPPER_BOTTOM_ROW: usize = 3;
 const TYPEARM_ROW: usize = 4;
-const KEY_ROW_1: usize = 5;
-const KEY_ROWS: usize = 4;
+const TYPEARM_ROW_2: usize = 5;
+const TYPEARM_ROW_3: usize = 6;
+const KEY_ROW_1: usize = TYPEARM_ROW_3 + 1;
+
+const N_KEY_ROWS: usize = 4;
 const N_KEYS: usize = 46;
-const KEYS_PER_ROW: usize = N_KEYS / KEY_ROWS;
+const KEYS_PER_ROW: usize = N_KEYS / N_KEY_ROWS;
 
 const HORZ_UP: char = '⎺';
 const HORZ: char = '─';
@@ -146,7 +149,7 @@ lazy_static! {
     );
 }
 
-const TYPEWRITER_HEIGHT: u16 = 10;
+const TYPEWRITER_HEIGHT: u16 = 11;
 const TYPEWRITER_MAX_WIDTH: u16 = 51;
 
 impl Typewriter {
@@ -197,14 +200,27 @@ impl Typewriter {
             });
         }
         let spacing: usize = ((width - n_arms) / 2).into();
-        SLANTR_3S
+        // TODO: maybe a helper fn here would be nice
+        SLANTL_3
             .chars()
             .enumerate()
             .for_each(|(i, c)| canvas[TYPEARM_ROW][spacing - i - 1] = c);
-        SLANTR_3S
+        SLANTR_3
+            .chars()
+            .enumerate()
+            .for_each(|(i, c)| canvas[TYPEARM_ROW_2][spacing - i - 1] = c);
+        SLANTL_3
             .chars()
             .enumerate()
             .for_each(|(i, c)| canvas[TYPEARM_ROW][width as usize - spacing + 1 + i] = c);
+        SLANTR_3S
+            .chars()
+            .enumerate()
+            .for_each(|(i, c)| canvas[TYPEARM_ROW_2][width as usize - spacing + 2 + i] = c);
+
+        for i in spacing..spacing + n_arms as usize {
+            canvas[TYPEARM_ROW_3][i] = HORZ;
+        }
 
         let key_start = (width as usize - KEY_1.chars().count()) / 2;
         KEY_1
@@ -238,9 +254,14 @@ impl Typewriter {
     }
 
     pub fn update_state(&mut self, key: char) {
-        if let Some(pos) = self.get_key_pos(key) {
-            self.buffer.push(key);
-            self.arms[pos].state = State::MoveUp;
+        match key {
+            ' ' => self.buffer.push(key),
+            _ => {
+                if let Some(pos) = self.get_key_pos(key) {
+                    self.buffer.push(key);
+                    self.arms[pos].state = State::MoveUp;
+                }
+            }
         }
     }
 
@@ -260,7 +281,6 @@ impl Typewriter {
         self.canvas[UPPER_BOTTOM_ROW].copy_from_slice(&self.typewriter_upper_bottom);
         self.draw_arms();
         let mut stdout = stdout();
-        stdout.queue(Clear(terminal::ClearType::FromCursorDown))?;
         stdout.queue(Print(&self))?;
         stdout.queue(cursor::MoveUp(self.height))?;
         stdout.flush()?;
