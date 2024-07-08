@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::fmt::write;
 use std::fmt::Display;
 use std::io::stdout;
 use std::io::BufRead;
@@ -15,7 +14,6 @@ use crossterm::event;
 use crossterm::style::Print;
 use crossterm::terminal::disable_raw_mode;
 use crossterm::terminal::enable_raw_mode;
-use crossterm::terminal::Clear;
 use crossterm::{terminal, QueueableCommand};
 use lazy_static::lazy_static;
 use portable_pty::unix::close_random_fds;
@@ -65,6 +63,9 @@ struct Typewriter {
     typewriter_upper: Vec<char>,
     typewriter_upper_slants: Vec<char>,
     typewriter_upper_bottom: Vec<char>,
+
+    key_start: usize,
+    prev_key: Option<&'static Key>,
 }
 
 impl Display for Typewriter {
@@ -142,7 +143,7 @@ lazy_static! {
                 ch,
                 Key {
                     row,
-                    col: idx * 2 + 1,
+                    col: idx * 2 + (row - KEY_ROW_1) % 2,
                     idx_in_row: idx,
                 }
             ))
@@ -250,6 +251,8 @@ impl Typewriter {
             typewriter_upper_slants,
             typewriter_upper_bottom,
             buffer: String::new(),
+            key_start,
+            prev_key: None,
         });
     }
 
@@ -257,9 +260,15 @@ impl Typewriter {
         match key {
             ' ' => self.buffer.push(key),
             _ => {
-                if let Some(pos) = self.get_key_pos(key) {
+                if let Some(k) = KEYMAPS.get(&key) {
+                    let pos = self.get_key_pos(k);
                     self.buffer.push(key);
                     self.arms[pos].state = State::MoveUp;
+                    if let Some(p) = self.prev_key {
+                        self.canvas[p.row][self.key_start + p.col] = '-';
+                    }
+                    self.canvas[k.row][self.key_start + k.col] = '_';
+                    self.prev_key = Some(k);
                 }
             }
         }
@@ -287,27 +296,24 @@ impl Typewriter {
         Ok(())
     }
 
-    fn get_key_pos(&self, key: char) -> Option<usize> {
-        if let Some(k) = KEYMAPS.get(&key) {
-            let spacing = self.width as usize / 2 - KEYS_PER_ROW;
-            let mid_arm = self.arms.len() / 2;
-            let lerp = self.arms.len() as f32 / N_KEYS as f32;
-            let pos = if k.col + spacing > self.mid.into() {
-                mid_arm
-                    + (lerp
-                        * (k.idx_in_row.abs_diff(KEYS_PER_ROW / 2)) as f32
-                        * (k.row - KEY_ROW_1 + 1) as f32)
-                        .round() as usize
-            } else {
-                mid_arm
-                    - (lerp
-                        * (k.idx_in_row.abs_diff(KEYS_PER_ROW / 2)) as f32
-                        * (k.row - KEY_ROW_1 + 1) as f32)
-                        .round() as usize
-            };
-            return Some(pos);
-        }
-        None
+    fn get_key_pos(&self, key: &Key) -> usize {
+        let spacing = self.width as usize / 2 - KEYS_PER_ROW;
+        let mid_arm = self.arms.len() / 2;
+        let lerp = self.arms.len() as f32 / N_KEYS as f32;
+        let pos = if key.col + spacing > self.mid.into() {
+            mid_arm
+                + (lerp
+                    * (key.idx_in_row.abs_diff(KEYS_PER_ROW / 2)) as f32
+                    * (key.row - KEY_ROW_1 + 1) as f32)
+                    .round() as usize
+        } else {
+            mid_arm
+                - (lerp
+                    * (key.idx_in_row.abs_diff(KEYS_PER_ROW / 2)) as f32
+                    * (key.row - KEY_ROW_1 + 1) as f32)
+                    .round() as usize
+        };
+        return pos;
     }
 
     pub fn draw_arms(&mut self) {
@@ -495,7 +501,6 @@ fn main() -> Result<(), anyhow::Error> {
     let mut stdout = stdout();
     stdout.queue(cursor::MoveToNextLine(1))?;
     typewriter.refresh()?;
-    stdout.flush()?;
 
     // Create a new pty
     let pair = pty_system.openpty(PtySize {
@@ -538,6 +543,10 @@ fn main() -> Result<(), anyhow::Error> {
                 },
                 _ => todo!(),
             };
+        } else {
+            if let Some(p) = typewriter.prev_key {
+                typewriter.canvas[p.row][typewriter.key_start + p.col] = '-';
+            }
         }
         typewriter.refresh()?;
         // match rx.try_recv() {
@@ -578,8 +587,8 @@ mod tests {
     fn test_get_pos() {
         let t = Typewriter::new(TYPEWRITER_HEIGHT, TYPEWRITER_MAX_WIDTH);
         assert_eq!(25, t.arms.len());
-        assert_eq!(Some(10), t.get_key_pos('1'));
-        assert_eq!(Some(15), t.get_key_pos('0'));
-        assert_eq!(Some(0), t.get_key_pos('z'));
+        assert_eq!(10, t.get_key_pos(KEYMAPS.get(&'1').unwrap()));
+        assert_eq!(15, t.get_key_pos(KEYMAPS.get(&'0').unwrap()));
+        assert_eq!(0, t.get_key_pos(KEYMAPS.get(&'z').unwrap()));
     }
 }
