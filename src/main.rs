@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt::write;
 use std::fmt::Display;
 use std::io::stdout;
 use std::io::BufRead;
@@ -12,8 +13,11 @@ use std::time::Duration;
 use crossterm::cursor;
 use crossterm::event;
 use crossterm::style::Print;
+use crossterm::style::PrintStyledContent;
+use crossterm::style::Stylize;
 use crossterm::terminal::disable_raw_mode;
 use crossterm::terminal::enable_raw_mode;
+use crossterm::ExecutableCommand;
 use crossterm::{terminal, QueueableCommand};
 use lazy_static::lazy_static;
 use portable_pty::unix::close_random_fds;
@@ -54,6 +58,7 @@ type Canvas = Vec<Vec<char>>;
 struct Typewriter {
     height: u16,
     width: u16,
+    paper_width: u16,
     mid: u16,
     pub canvas: Canvas,
     pub arms: Vec<Arm>,
@@ -70,7 +75,7 @@ struct Typewriter {
 
 impl Display for Typewriter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for row in &*self.canvas {
+        for row in &self.canvas[1..] {
             for c in row {
                 write!(f, "{}", c)?;
             }
@@ -80,7 +85,8 @@ impl Display for Typewriter {
     }
 }
 
-const PRINT_ROW: usize = 0;
+const TYPEWRITER_HEIGHT: u16 = 11;
+
 const UPPER_ROW: usize = 1;
 const UPPER_SLANTS_ROW: usize = 2;
 const UPPER_BOTTOM_ROW: usize = 3;
@@ -114,9 +120,8 @@ struct Key {
 }
 
 #[rustfmt::skip]
-// TODO: support uppercase
 const QWERTY: [char; N_KEYS] = [
-    '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '+',
+    '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=',
     '\u{9}', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p','\u{8}',
     'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '\n',
     'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/',
@@ -139,6 +144,27 @@ lazy_static! {
                     }
                 }
             })
+            // Uppercase
+            .flat_map(|it| {
+                match it.2 {
+                    '1' => std::iter::once(it).chain(Some((it.0, it.1, '!'))),
+                    '2' => std::iter::once(it).chain(Some((it.0, it.1, '@'))),
+                    '3' => std::iter::once(it).chain(Some((it.0, it.1, '#'))),
+                    '4' => std::iter::once(it).chain(Some((it.0, it.1, '$'))),
+                    '5' => std::iter::once(it).chain(Some((it.0, it.1, '%'))),
+                    '6' => std::iter::once(it).chain(Some((it.0, it.1, '^'))),
+                    '7' => std::iter::once(it).chain(Some((it.0, it.1, '&'))),
+                    '8' => std::iter::once(it).chain(Some((it.0, it.1, '*'))),
+                    '9' => std::iter::once(it).chain(Some((it.0, it.1, '('))),
+                    '0' => std::iter::once(it).chain(Some((it.0, it.1, ')'))),
+                    '-' => std::iter::once(it).chain(Some((it.0, it.1, '_'))),
+                    '=' => std::iter::once(it).chain(Some((it.0, it.1, '+'))),
+                    ';' => std::iter::once(it).chain(Some((it.0, it.1, ':'))),
+                    '\'' => std::iter::once(it).chain(Some((it.0, it.1, '"'))),
+                    '/' => std::iter::once(it).chain(Some((it.0, it.1, '?'))),
+                    _ => std::iter::once(it).chain(None),
+                }
+            })
             .map(|(row, idx, ch)| (
                 ch,
                 Key {
@@ -150,14 +176,20 @@ lazy_static! {
     );
 }
 
-const TYPEWRITER_HEIGHT: u16 = 11;
-const TYPEWRITER_MAX_WIDTH: u16 = 51;
-
 impl Typewriter {
-    pub fn new(height: u16, width: u16) -> Box<Typewriter> {
-        let typewriter_upper_width = 43;
+    pub fn new(height: u16, window_width: u16) -> Box<Typewriter> {
+        const TYPEWRITER_MIN_WIDTH: u16 = KEY_1.len() as u16;
+        const MAX_PAPER_WIDTH: u16 = 90;
+        // the smallest paper we can fit is the amount of characters we can type without moving the
+        // paper off screen
+        const MIN_PAPER_WIDTH: u16 = TYPEWRITER_MIN_WIDTH / 2;
+        let paper_width = (window_width / 2).clamp(MIN_PAPER_WIDTH, MAX_PAPER_WIDTH);
+        let width = (window_width - paper_width).min(paper_width) * 2;
+        dbg!(window_width, paper_width, width);
+
         let mut typewriter_upper = vec![' '; width.into()];
-        let upper_space = (TYPEWRITER_MAX_WIDTH - typewriter_upper_width) / 2;
+        let upper_space = 4;
+        let typewriter_upper_width = width - upper_space * 2;
         for i in 1..typewriter_upper_width {
             typewriter_upper[(upper_space + i) as usize] = HORZ;
         }
@@ -186,7 +218,7 @@ impl Typewriter {
 
         let mut arms = Vec::new();
         let mid = width / 2;
-        let n_arms = width / 2;
+        let n_arms = (width / 2).min(N_KEYS as u16);
         let mid_arm = n_arms / 2;
         for i in 0..n_arms {
             arms.push(Arm {
@@ -241,9 +273,13 @@ impl Typewriter {
             .enumerate()
             .for_each(|(i, c)| canvas[KEY_ROW_1 + 3][key_start + i] = c);
 
+        // let space_bar_down =
+        // canvas[KEY_ROW_1 + 4].iter_mut().enumerate().for_each(|cell| )
+
         return Box::new(Typewriter {
             height,
             width,
+            paper_width,
             canvas,
             arms,
             mid,
@@ -258,7 +294,9 @@ impl Typewriter {
 
     pub fn update_state(&mut self, key: char) {
         match key {
-            ' ' => self.buffer.push(key),
+            ' ' => {
+                self.buffer.push(key);
+            }
             _ => {
                 if let Some(k) = KEYMAPS.get(&key) {
                     let pos = self.get_key_pos(k);
@@ -275,21 +313,21 @@ impl Typewriter {
     }
 
     pub fn refresh(&mut self) -> Result<(), anyhow::Error> {
-        self.canvas[0].fill(' ');
-        let mut input = self.buffer.chars();
-        let print_pos = self.mid as usize - self.buffer.len();
-        for (i, cell) in self.canvas[0].iter_mut().enumerate() {
-            if i >= print_pos {
-                if let Some(t) = &input.next() {
-                    *cell = t.clone();
-                }
-            }
-        }
         self.canvas[UPPER_ROW].copy_from_slice(&self.typewriter_upper);
         self.canvas[UPPER_SLANTS_ROW].copy_from_slice(&self.typewriter_upper_slants);
         self.canvas[UPPER_BOTTOM_ROW].copy_from_slice(&self.typewriter_upper_bottom);
-        self.draw_arms();
+        self.update_arms();
         let mut stdout = stdout();
+        let print_pos = self.mid as usize - self.buffer.len();
+        let remaining_paper = self.paper_width as usize - self.buffer.len();
+        crossterm::queue!(
+            stdout,
+            Print(" ".repeat(print_pos)),
+            PrintStyledContent(self.buffer.clone().black().on_white()),
+            PrintStyledContent(" ".repeat(remaining_paper).on_white()),
+            terminal::Clear(terminal::ClearType::UntilNewLine),
+            Print("\r\n"),
+        )?;
         stdout.queue(Print(&self))?;
         stdout.queue(cursor::MoveUp(self.height))?;
         stdout.flush()?;
@@ -316,7 +354,7 @@ impl Typewriter {
         return pos;
     }
 
-    pub fn draw_arms(&mut self) {
+    pub fn update_arms(&mut self) {
         let mid_arm = self.arms.len() / 2;
         let spacing = (self.width - self.arms.len() as u16) / 2;
         for (i, arm) in self.arms.iter_mut().enumerate() {
@@ -331,7 +369,6 @@ impl Typewriter {
                 State::Rest => State::Rest,
                 State::MoveUp => State::Strike,
                 State::Strike => State::MoveDown,
-                // _ => arm.state,
                 State::MoveDown => State::Rest,
             }
         }
@@ -354,6 +391,11 @@ impl Typewriter {
                     },
                 ],
                 State::MoveUp | State::MoveDown => vec![
+                    Draw {
+                        c: ' ',
+                        row_offset: 1,
+                        col_offset: 0,
+                    },
                     Draw {
                         c: VERT,
                         row_offset: 0,
@@ -382,6 +424,11 @@ impl Typewriter {
                 ],
                 State::MoveUp | State::MoveDown => vec![
                     Draw {
+                        c: ' ',
+                        row_offset: 1,
+                        col_offset: if flip { 1 } else { -1 },
+                    },
+                    Draw {
                         c: if flip { SLANTR_2 } else { SLANTL_2 },
                         row_offset: 0,
                         col_offset: 0,
@@ -408,6 +455,11 @@ impl Typewriter {
                     },
                 ],
                 State::MoveUp | State::MoveDown => vec![
+                    Draw {
+                        c: ' ',
+                        row_offset: 1,
+                        col_offset: if flip { 1 } else { -1 },
+                    },
                     Draw {
                         c: if flip { SLANTR_2 } else { SLANTL_2 },
                         row_offset: 0,
@@ -493,12 +545,13 @@ fn main() -> Result<(), anyhow::Error> {
     // Use the native pty implementation for the system
     let pty_system = native_pty_system();
 
-    let mut typewriter = Typewriter::new(TYPEWRITER_HEIGHT, TYPEWRITER_MAX_WIDTH);
-
-    typewriter.draw_arms();
-
     let window_size = terminal::window_size()?;
+
+    println!("window: {}", window_size.columns);
+    let mut typewriter = Typewriter::new(TYPEWRITER_HEIGHT, 60);
+
     let mut stdout = stdout();
+    stdout.queue(cursor::Hide)?;
     stdout.queue(cursor::MoveToNextLine(1))?;
     typewriter.refresh()?;
 
@@ -565,6 +618,7 @@ fn cleanup(mut child: Box<dyn Child + Send + Sync>) {
     let _ = child.kill();
     close_random_fds();
     let _ = disable_raw_mode();
+    let _ = stdout().execute(cursor::Show);
 }
 
 fn spawn_pty_channel(mut reader: impl BufRead + std::marker::Send + 'static) -> Receiver<[u8; 1]> {
