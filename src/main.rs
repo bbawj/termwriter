@@ -83,7 +83,7 @@ struct Typewriter {
 
     is_shift_pressed: bool,
     key_start: usize,
-    prev_key: Option<&'static Key>,
+    prev_key: Option<Keys>,
 }
 
 impl Display for Typewriter {
@@ -107,6 +107,7 @@ const TYPEARM_ROW: usize = 4;
 const TYPEARM_ROW_2: usize = 5;
 const TYPEARM_ROW_3: usize = 6;
 const KEY_ROW_1: usize = TYPEARM_ROW_3 + 1;
+const SPACE_ROW: usize = TYPEARM_ROW_3 + 4;
 
 const N_KEY_ROWS: usize = 4;
 const N_KEYS: usize = 46;
@@ -125,13 +126,19 @@ const SLANTL_3: &str = "⎺⎻⎼⎽";
 const SLANTL_3S: &str = "⎺⎻⎼";
 const KEY_1: &str = "- - - - - - - - - - - -";
 const KEY_2: &str = " - - - - - - - - - - -";
-const SPACE_BAR: [char; 23] = [HORZ; KEY_1.len()];
+const SPACE_BAR: [char; 23] = ['-'; KEY_1.len()];
+const SPACE_BAR_DOWN: [char; 23] = ['_'; KEY_1.len()];
 
 #[derive(Debug)]
 struct Key {
     row: usize,
     col: usize,
     idx_in_row: usize,
+}
+
+enum Keys {
+    Space,
+    Key(&'static Key),
 }
 
 const SHIFT: char = '\u{1}';
@@ -373,8 +380,7 @@ impl Typewriter {
             .enumerate()
             .for_each(|(i, c)| canvas[KEY_ROW_1 + 3][key_start + i] = c);
 
-        // let space_bar_down =
-        // canvas[KEY_ROW_1 + 4].iter_mut().enumerate().for_each(|cell| )
+        canvas[SPACE_ROW][key_start..key_start + 23].copy_from_slice(&SPACE_BAR);
 
         return Box::new(Typewriter {
             win_height,
@@ -401,12 +407,15 @@ impl Typewriter {
                 assert!(false);
                 let k = KEYMAPS.get(&key).unwrap();
                 self.canvas[k.row][self.key_start + k.col] = '_';
-                self.prev_key = Some(k);
+                self.prev_key = Some(Keys::Key(k));
             }
             ' ' => {
                 if self.buffer.len() != self.paper_width.into() {
                     self.buffer.push(key);
                 }
+                self.canvas[SPACE_ROW][self.key_start..self.key_start + 23]
+                    .copy_from_slice(&SPACE_BAR_DOWN);
+                self.prev_key = Some(Keys::Space);
             }
             _ => {
                 if let Some(k) = KEYMAPS.get(&key.to_ascii_lowercase()) {
@@ -417,12 +426,19 @@ impl Typewriter {
                         self.buffer.push(key);
                     }
                     self.arms[pos].state = State::MoveUp;
-                    if let Some(p) = self.prev_key {
-                        self.canvas[p.row][self.key_start + p.col] = '-';
-                    }
                     self.canvas[k.row][self.key_start + k.col] = '_';
-                    self.prev_key = Some(k);
+                    self.prev_key = Some(Keys::Key(k));
                 }
+            }
+        };
+    }
+
+    pub fn unset_prev_key(&mut self) {
+        if let Some(p) = self.prev_key.take() {
+            match p {
+                Keys::Space => self.canvas[SPACE_ROW][self.key_start..self.key_start + 23]
+                    .copy_from_slice(&SPACE_BAR),
+                Keys::Key(k) => self.canvas[k.row][self.key_start + k.col] = '-',
             }
         }
     }
@@ -709,6 +725,7 @@ fn main() -> Result<(), anyhow::Error> {
     // let mut written = false;
     enable_raw_mode()?;
     loop {
+        typewriter.unset_prev_key();
         // TODO: use delta to cap FPS
         // TODO: print FPS
         if event::poll(Duration::from_millis(33))? {
@@ -742,11 +759,8 @@ fn main() -> Result<(), anyhow::Error> {
                 },
                 _ => todo!(),
             };
-        } else {
-            if let Some(p) = typewriter.prev_key {
-                typewriter.canvas[p.row][typewriter.key_start + p.col] = '-';
-            }
         }
+
         match rx.try_recv() {
             Ok(s) => {
                 // dbg!(&s);
@@ -756,9 +770,6 @@ fn main() -> Result<(), anyhow::Error> {
                         typewriter
                             .printed_paper
                             .push(String::from_utf8(c.to_vec()).unwrap());
-                        // typewriter
-                        //     .draw_text(std::str::from_utf8(c).unwrap())
-                        //     .unwrap()
                     });
             }
             Err(mpsc::TryRecvError::Empty) => {
@@ -788,17 +799,11 @@ fn spawn_pty_channel(mut reader: impl BufRead + std::marker::Send + 'static) -> 
         if let Err(_) = reader.read_line(&mut buffer) {
             break;
         };
-        if let Err(_) = tx.send(strip_ansi(&buffer)) {
+        if let Err(_) = tx.send(buffer) {
             break;
         }
     });
     rx
-}
-
-fn strip_ansi(text: &str) -> String {
-    // let re = Regex::new(r"\x1b\[[0-9]*[ -/]*m").unwrap();
-    // let sanitized = re.replace_all(text, "");
-    text.trim().to_string()
 }
 
 #[cfg(test)]
