@@ -75,6 +75,7 @@ struct Typewriter {
     pub arms: Vec<Arm>,
 
     buffer: String,
+    printed_paper: PaperRingBuffer,
 
     typewriter_upper: Vec<char>,
     typewriter_upper_slants: Vec<char>,
@@ -191,6 +192,93 @@ lazy_static! {
     );
 }
 
+#[derive(Debug)]
+struct PaperRingBuffer {
+    cap: u16,
+    size: u16,
+    head: u16,
+    tail: u16,
+    buffer: Vec<String>,
+}
+
+impl PaperRingBuffer {
+    pub fn new(height: u16) -> Self {
+        assert!(height > 0);
+        PaperRingBuffer {
+            cap: height,
+            size: 0,
+            head: 0,
+            tail: 0,
+            buffer: vec![String::default(); height.into()],
+        }
+    }
+
+    pub fn push(&mut self, line: String) {
+        self.buffer[self.head as usize] = line;
+        if self.size > 0 && self.head == self.tail {
+            self.tail = (self.tail + 1) % self.cap;
+        }
+        self.head = (self.head + 1) % self.cap;
+        if self.size < self.cap {
+            self.size += 1;
+        };
+    }
+}
+
+struct PaperRingBufferIter<'a> {
+    buffer: &'a PaperRingBuffer,
+    it: u16,
+}
+
+impl<'a> Iterator for PaperRingBufferIter<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.it == self.buffer.size {
+            return None;
+        }
+        let res = Some(
+            self.buffer.buffer[usize::from((self.buffer.tail + self.it) % self.buffer.cap)]
+                .as_ref(),
+        );
+        self.it += 1;
+        return res;
+    }
+}
+
+impl<'a> IntoIterator for &'a PaperRingBuffer {
+    type Item = &'a str;
+
+    type IntoIter = PaperRingBufferIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        PaperRingBufferIter {
+            buffer: self,
+            it: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod test_paper {
+    use super::PaperRingBuffer;
+
+    #[test]
+    fn test() {
+        let mut p = PaperRingBuffer::new(3);
+        p.push("hello".to_string());
+        p.push("world".to_string());
+        dbg!(&p);
+        p.push("lmao".to_string());
+        let mut iter = p.into_iter();
+        dbg!(&p);
+        assert_eq!(iter.next(), Some("hello"));
+        assert_eq!(iter.next(), Some("world"));
+        assert_eq!(iter.next(), Some("lmao"));
+        assert_eq!(iter.next(), None);
+    }
+}
+
 impl Typewriter {
     pub fn new(height: u16, window_width: u16, win_height: u16) -> Box<Typewriter> {
         const TYPEWRITER_MIN_WIDTH: u16 = KEY_1.len() as u16;
@@ -303,6 +391,7 @@ impl Typewriter {
             key_start,
             prev_key: None,
             is_shift_pressed: false,
+            printed_paper: PaperRingBuffer::new(win_height - height - 1),
         });
     }
 
@@ -344,10 +433,14 @@ impl Typewriter {
         self.canvas[UPPER_BOTTOM_ROW].copy_from_slice(&self.typewriter_upper_bottom);
         self.update_arms();
         let mut stdout = stdout();
+        for line in self.printed_paper.into_iter() {
+            // dbg!(line, &self.printed_paper);
+            self.draw_text(line)?;
+        }
         self.draw_text(&self.buffer)?;
         stdout.queue(Clear(terminal::ClearType::FromCursorDown))?;
         stdout.queue(Print(&self))?;
-        stdout.queue(cursor::MoveUp(self.height))?;
+        stdout.queue(cursor::MoveUp(self.height + self.printed_paper.size))?;
         stdout.flush()?;
         Ok(())
     }
@@ -661,8 +754,11 @@ fn main() -> Result<(), anyhow::Error> {
                     .chunks(typewriter.paper_width.into())
                     .for_each(|c| {
                         typewriter
-                            .draw_text(std::str::from_utf8(c).unwrap())
-                            .unwrap()
+                            .printed_paper
+                            .push(String::from_utf8(c.to_vec()).unwrap());
+                        // typewriter
+                        //     .draw_text(std::str::from_utf8(c).unwrap())
+                        //     .unwrap()
                     });
             }
             Err(mpsc::TryRecvError::Empty) => {
