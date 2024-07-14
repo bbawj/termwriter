@@ -1,10 +1,12 @@
 use std::collections::HashMap;
-use std::fmt::write;
 use std::fmt::Display;
 use std::io::stdout;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Write;
+use std::process::Child;
+use std::process::Command;
+use std::process::Stdio;
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
 use std::thread;
@@ -22,9 +24,6 @@ use crossterm::terminal::enable_raw_mode;
 use crossterm::terminal::Clear;
 use crossterm::{terminal, QueueableCommand};
 use lazy_static::lazy_static;
-use portable_pty::unix::close_random_fds;
-use portable_pty::Child;
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 #[derive(Clone, Copy)]
 enum ArmType {
@@ -587,9 +586,6 @@ impl Typewriter {
 }
 
 fn main() -> Result<(), anyhow::Error> {
-    // Use the native pty implementation for the system
-    let pty_system = native_pty_system();
-
     let window_size = terminal::window_size()?;
 
     let mut typewriter = Typewriter::new(TYPEWRITER_HEIGHT, 60, window_size.rows);
@@ -602,28 +598,22 @@ fn main() -> Result<(), anyhow::Error> {
         event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
     ))?;
     stdout.queue(cursor::Hide)?;
-    // stdout.queue(cursor::MoveToNextLine(1))?;
     typewriter.refresh()?;
 
-    // Create a new pty
-    let pair = pty_system.openpty(PtySize {
-        rows: TYPEWRITER_HEIGHT,
-        cols: typewriter.paper_width,
-        pixel_width: 0,
-        pixel_height: 0,
-    })?;
-
-    // Spawn a shell into the pty
-    let cmd = CommandBuilder::new_default_prog();
-    let mut child = pair.slave.spawn_command(cmd)?;
+    let mut child = Command::new("sh")
+        .stdout(Stdio::piped())
+        .stdin(Stdio::piped())
+        .spawn()?;
 
     // Read and parse output from the pty with reader
-    let reader = BufReader::new(pair.master.try_clone_reader()?);
+    // let reader = BufReader::new(pair.master.try_clone_reader()?);
+    let reader = BufReader::new(child.stdout.take().unwrap());
 
     // Send data to the pty by writing to the master
-    let mut writer = pair.master.take_writer()?;
+    // let mut writer = pair.master.take_writer()?;
+    let mut writer = child.stdin.take().unwrap();
     let rx = spawn_pty_channel(reader);
-    let mut written = false;
+    // let mut written = false;
     enable_raw_mode()?;
     loop {
         // TODO: use delta to cap FPS
@@ -638,7 +628,7 @@ fn main() -> Result<(), anyhow::Error> {
                         writeln!(writer, "{}", typewriter.buffer)?;
                         // dbg!("test");
                         writer.flush()?;
-                        written = true;
+                        // written = true;
                     }
                     event::KeyCode::Tab => todo!(),
                     event::KeyCode::Char(c) => {
@@ -666,19 +656,14 @@ fn main() -> Result<(), anyhow::Error> {
         }
         match rx.try_recv() {
             Ok(s) => {
-                if written {
-                    written = false;
-                } else {
-                    // TODO: how to get the output nicely on the page
-                    crossterm::queue!(
-                        stdout,
-                        // cursor::MoveTo(0, typewriter.win_height - 1 - typewriter.height - 2),
-                        terminal::Clear(terminal::ClearType::UntilNewLine),
-                        Print(s),
-                        Print("\r\n"),
-                    )?;
-                    // typewriter.draw_text(&s)?;
-                }
+                // dbg!(&s);
+                s.as_bytes()
+                    .chunks(typewriter.paper_width.into())
+                    .for_each(|c| {
+                        typewriter
+                            .draw_text(std::str::from_utf8(c).unwrap())
+                            .unwrap()
+                    });
             }
             Err(mpsc::TryRecvError::Empty) => {
                 // stdout.write(b"\n")?;
@@ -694,9 +679,8 @@ fn main() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-fn cleanup(mut child: Box<dyn Child + Send + Sync>) {
+fn cleanup(mut child: Child) {
     let _ = child.kill();
-    close_random_fds();
     let _ = disable_raw_mode();
     let _ = crossterm::execute!(stdout(), PopKeyboardEnhancementFlags, cursor::Show);
 }
