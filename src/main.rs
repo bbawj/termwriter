@@ -12,12 +12,14 @@ use std::time::Duration;
 
 use crossterm::cursor;
 use crossterm::event;
+use crossterm::event::PopKeyboardEnhancementFlags;
+use crossterm::event::PushKeyboardEnhancementFlags;
 use crossterm::style::Print;
 use crossterm::style::PrintStyledContent;
 use crossterm::style::Stylize;
 use crossterm::terminal::disable_raw_mode;
 use crossterm::terminal::enable_raw_mode;
-use crossterm::ExecutableCommand;
+use crossterm::terminal::Clear;
 use crossterm::{terminal, QueueableCommand};
 use lazy_static::lazy_static;
 use portable_pty::unix::close_random_fds;
@@ -46,6 +48,15 @@ struct Arm {
     state: State,
 }
 
+impl Default for Arm {
+    fn default() -> Self {
+        Arm {
+            arm_type: ArmType::T0,
+            state: State::Rest,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Draw {
     c: char,
@@ -56,6 +67,7 @@ struct Draw {
 type Canvas = Vec<Vec<char>>;
 
 struct Typewriter {
+    win_height: u16,
     height: u16,
     width: u16,
     paper_width: u16,
@@ -69,6 +81,7 @@ struct Typewriter {
     typewriter_upper_slants: Vec<char>,
     typewriter_upper_bottom: Vec<char>,
 
+    is_shift_pressed: bool,
     key_start: usize,
     prev_key: Option<&'static Key>,
 }
@@ -112,19 +125,22 @@ const SLANTL_3: &str = "⎺⎻⎼⎽";
 const SLANTL_3S: &str = "⎺⎻⎼";
 const KEY_1: &str = "- - - - - - - - - - - -";
 const KEY_2: &str = " - - - - - - - - - - -";
+const SPACE_BAR: [char; 23] = [HORZ; KEY_1.len()];
 
+#[derive(Debug)]
 struct Key {
     row: usize,
     col: usize,
     idx_in_row: usize,
 }
 
+const SHIFT: char = '\u{1}';
 #[rustfmt::skip]
 const QWERTY: [char; N_KEYS] = [
     '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=',
-    '\u{9}', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p','\u{8}',
+    'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p','\u{8}',
     'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '\n',
-    'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/',
+    SHIFT, 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/',
 ];
 
 lazy_static! {
@@ -133,7 +149,7 @@ lazy_static! {
             .into_iter()
             .scan((KEY_ROW_1, 0), |(cur_row, idx), c| {
                 match c {
-                    '\u{9}' | 'a' | 'z' => {
+                    'q' | 'a' | SHIFT => {
                         *cur_row += 1;
                         *idx = 0;
                         Some((*cur_row, *idx, c))
@@ -177,7 +193,7 @@ lazy_static! {
 }
 
 impl Typewriter {
-    pub fn new(height: u16, window_width: u16) -> Box<Typewriter> {
+    pub fn new(height: u16, window_width: u16, win_height: u16) -> Box<Typewriter> {
         const TYPEWRITER_MIN_WIDTH: u16 = KEY_1.len() as u16;
         const MAX_PAPER_WIDTH: u16 = 90;
         // the smallest paper we can fit is the amount of characters we can type without moving the
@@ -185,7 +201,7 @@ impl Typewriter {
         const MIN_PAPER_WIDTH: u16 = TYPEWRITER_MIN_WIDTH / 2;
         let paper_width = (window_width / 2).clamp(MIN_PAPER_WIDTH, MAX_PAPER_WIDTH);
         let width = (window_width - paper_width).min(paper_width) * 2;
-        dbg!(window_width, paper_width, width);
+        // dbg!(window_width, paper_width, width);
 
         let mut typewriter_upper = vec![' '; width.into()];
         let upper_space = 4;
@@ -216,21 +232,18 @@ impl Typewriter {
 
         let mut canvas = vec![vec![' '; width.into()]; height.into()];
 
-        let mut arms = Vec::new();
         let mid = width / 2;
         let n_arms = (width / 2).min(N_KEYS as u16);
         let mid_arm = n_arms / 2;
-        for i in 0..n_arms {
-            arms.push(Arm {
-                arm_type: if i == mid_arm {
-                    ArmType::T0
-                } else if i < mid_arm / 2 || i > mid_arm + mid_arm / 2 {
-                    ArmType::T2
-                } else {
-                    ArmType::T1
-                },
-                state: State::Rest,
-            });
+        let mut arms = vec![Arm::default(); n_arms.into()];
+        for (i, arm) in arms.iter_mut().enumerate() {
+            arm.arm_type = if i as u16 == mid_arm {
+                ArmType::T0
+            } else if i < usize::from(mid_arm) / 2 || i > usize::from(mid_arm + mid_arm / 2) {
+                ArmType::T2
+            } else {
+                ArmType::T1
+            };
         }
         let spacing: usize = ((width - n_arms) / 2).into();
         // TODO: maybe a helper fn here would be nice
@@ -277,6 +290,7 @@ impl Typewriter {
         // canvas[KEY_ROW_1 + 4].iter_mut().enumerate().for_each(|cell| )
 
         return Box::new(Typewriter {
+            win_height,
             height,
             width,
             paper_width,
@@ -289,18 +303,31 @@ impl Typewriter {
             buffer: String::new(),
             key_start,
             prev_key: None,
+            is_shift_pressed: false,
         });
     }
 
-    pub fn update_state(&mut self, key: char) {
-        match key {
+    pub fn update_state(&mut self, key: char, is_shift_pressed: bool) {
+        match key.to_ascii_lowercase() {
+            SHIFT => {
+                assert!(false);
+                let k = KEYMAPS.get(&key).unwrap();
+                self.canvas[k.row][self.key_start + k.col] = '_';
+                self.prev_key = Some(k);
+            }
             ' ' => {
-                self.buffer.push(key);
+                if self.buffer.len() != self.paper_width.into() {
+                    self.buffer.push(key);
+                }
             }
             _ => {
-                if let Some(k) = KEYMAPS.get(&key) {
+                if let Some(k) = KEYMAPS.get(&key.to_ascii_lowercase()) {
+                    self.is_shift_pressed = is_shift_pressed;
+
                     let pos = self.get_key_pos(k);
-                    self.buffer.push(key);
+                    if self.buffer.len() != self.paper_width.into() {
+                        self.buffer.push(key);
+                    }
                     self.arms[pos].state = State::MoveUp;
                     if let Some(p) = self.prev_key {
                         self.canvas[p.row][self.key_start + p.col] = '-';
@@ -318,38 +345,54 @@ impl Typewriter {
         self.canvas[UPPER_BOTTOM_ROW].copy_from_slice(&self.typewriter_upper_bottom);
         self.update_arms();
         let mut stdout = stdout();
-        let print_pos = self.mid as usize - self.buffer.len();
-        let remaining_paper = self.paper_width as usize - self.buffer.len();
-        crossterm::queue!(
-            stdout,
-            Print(" ".repeat(print_pos)),
-            PrintStyledContent(self.buffer.clone().black().on_white()),
-            PrintStyledContent(" ".repeat(remaining_paper).on_white()),
-            terminal::Clear(terminal::ClearType::UntilNewLine),
-            Print("\r\n"),
-        )?;
+        self.draw_text(&self.buffer)?;
+        stdout.queue(Clear(terminal::ClearType::FromCursorDown))?;
         stdout.queue(Print(&self))?;
         stdout.queue(cursor::MoveUp(self.height))?;
         stdout.flush()?;
         Ok(())
     }
 
+    fn draw_text(&self, text: &str) -> Result<(), anyhow::Error> {
+        let mut stdout = stdout();
+        let print_pos = self.mid as usize - self.buffer.len();
+        // TODO: how to draw the striking cursor?
+        crossterm::queue!(
+            stdout,
+            cursor::Hide,
+            Print(" ".repeat(print_pos)),
+            PrintStyledContent(text.black().on_white()),
+        )?;
+        let (col, _) = cursor::position()?;
+        crossterm::queue!(
+            stdout,
+            PrintStyledContent(
+                " ".repeat(
+                    (print_pos + self.paper_width as usize)
+                        .checked_sub(col.into())
+                        .unwrap_or(0)
+                )
+                .on_white()
+            ),
+            terminal::Clear(terminal::ClearType::UntilNewLine),
+            Print("\r\n"),
+        )?;
+        Ok(())
+    }
+
     fn get_key_pos(&self, key: &Key) -> usize {
-        let spacing = self.width as usize / 2 - KEYS_PER_ROW;
+        // let spacing = self.width as usize / 2 - KEYS_PER_ROW;
         let mid_arm = self.arms.len() / 2;
         let lerp = self.arms.len() as f32 / N_KEYS as f32;
-        let pos = if key.col + spacing > self.mid.into() {
-            mid_arm
-                + (lerp
-                    * (key.idx_in_row.abs_diff(KEYS_PER_ROW / 2)) as f32
-                    * (key.row - KEY_ROW_1 + 1) as f32)
-                    .round() as usize
+        let offset = (lerp
+            * (key.idx_in_row.abs_diff(KEYS_PER_ROW / 2)) as f32
+            * (key.row - KEY_ROW_1 + 1) as f32)
+            .round() as usize;
+        // dbg!(mid_arm, lerp, key, offset);
+        let pos = if key.col + self.key_start > self.mid.into() {
+            mid_arm + offset
         } else {
-            mid_arm
-                - (lerp
-                    * (key.idx_in_row.abs_diff(KEYS_PER_ROW / 2)) as f32
-                    * (key.row - KEY_ROW_1 + 1) as f32)
-                    .round() as usize
+            mid_arm - offset
         };
         return pos;
     }
@@ -357,11 +400,13 @@ impl Typewriter {
     pub fn update_arms(&mut self) {
         let mid_arm = self.arms.len() / 2;
         let spacing = (self.width - self.arms.len() as u16) / 2;
+        let shifted: i16 = if self.is_shift_pressed { -1 } else { 0 };
         for (i, arm) in self.arms.iter_mut().enumerate() {
             let flip = if i < mid_arm { 0 } else { 1 };
             let cmds = Self::draw_arm(&arm, flip != 0, i as u16, mid_arm as u16);
             for cmd in cmds {
-                self.canvas[usize::try_from(TYPEARM_ROW as i16 + cmd.row_offset).unwrap()]
+                self.canvas[usize::try_from(TYPEARM_ROW as i16 + shifted + cmd.row_offset)
+                    .unwrap_or_default()]
                     [usize::try_from((spacing as i16 + i as i16) + cmd.col_offset).unwrap()] =
                     cmd.c;
             }
@@ -547,24 +592,29 @@ fn main() -> Result<(), anyhow::Error> {
 
     let window_size = terminal::window_size()?;
 
-    println!("window: {}", window_size.columns);
-    let mut typewriter = Typewriter::new(TYPEWRITER_HEIGHT, 60);
+    let mut typewriter = Typewriter::new(TYPEWRITER_HEIGHT, 60, window_size.rows);
 
     let mut stdout = stdout();
+    stdout.queue(PushKeyboardEnhancementFlags(
+        event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+    ))?;
+    stdout.queue(PushKeyboardEnhancementFlags(
+        event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+    ))?;
     stdout.queue(cursor::Hide)?;
-    stdout.queue(cursor::MoveToNextLine(1))?;
+    // stdout.queue(cursor::MoveToNextLine(1))?;
     typewriter.refresh()?;
 
     // Create a new pty
     let pair = pty_system.openpty(PtySize {
-        rows: window_size.rows,
-        cols: window_size.columns,
-        pixel_width: window_size.width,
-        pixel_height: window_size.height,
+        rows: TYPEWRITER_HEIGHT,
+        cols: typewriter.paper_width,
+        pixel_width: 0,
+        pixel_height: 0,
     })?;
 
     // Spawn a shell into the pty
-    let cmd = CommandBuilder::new("bash");
+    let cmd = CommandBuilder::new_default_prog();
     let mut child = pair.slave.spawn_command(cmd)?;
 
     // Read and parse output from the pty with reader
@@ -572,26 +622,39 @@ fn main() -> Result<(), anyhow::Error> {
 
     // Send data to the pty by writing to the master
     let mut writer = pair.master.take_writer()?;
-    // writeln!(writer, "ls -l\n")?;
-    // writer.flush()?;
     let rx = spawn_pty_channel(reader);
+    let mut written = false;
     enable_raw_mode()?;
     loop {
+        // TODO: use delta to cap FPS
+        // TODO: print FPS
         if event::poll(Duration::from_millis(33))? {
             match event::read()? {
                 event::Event::Key(e) => match e.code {
-                    event::KeyCode::Backspace => todo!(),
-                    event::KeyCode::Enter => todo!(),
+                    event::KeyCode::Backspace => {
+                        typewriter.buffer.pop();
+                    }
+                    event::KeyCode::Enter => {
+                        writeln!(writer, "{}", typewriter.buffer)?;
+                        // dbg!("test");
+                        writer.flush()?;
+                        written = true;
+                    }
                     event::KeyCode::Tab => todo!(),
                     event::KeyCode::Char(c) => {
                         if c == 'c' && e.modifiers.contains(event::KeyModifiers::CONTROL) {
                             break;
                         }
-                        typewriter.update_state(c);
+                        typewriter
+                            .update_state(c, e.modifiers.contains(event::KeyModifiers::SHIFT));
                     }
                     event::KeyCode::Esc => todo!(),
                     event::KeyCode::CapsLock => todo!(),
-                    event::KeyCode::Modifier(_) => todo!(),
+                    event::KeyCode::Modifier(m) => {
+                        if m == event::ModifierKeyCode::LeftShift {
+                            typewriter.update_state(SHIFT, false);
+                        }
+                    }
                     _ => continue,
                 },
                 _ => todo!(),
@@ -601,14 +664,31 @@ fn main() -> Result<(), anyhow::Error> {
                 typewriter.canvas[p.row][typewriter.key_start + p.col] = '-';
             }
         }
+        match rx.try_recv() {
+            Ok(s) => {
+                if written {
+                    written = false;
+                } else {
+                    // TODO: how to get the output nicely on the page
+                    crossterm::queue!(
+                        stdout,
+                        // cursor::MoveTo(0, typewriter.win_height - 1 - typewriter.height - 2),
+                        terminal::Clear(terminal::ClearType::UntilNewLine),
+                        Print(s),
+                        Print("\r\n"),
+                    )?;
+                    // typewriter.draw_text(&s)?;
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                // stdout.write(b"\n")?;
+                // writeln!(stdout, "{}\n", s.as_bytes())?;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                break;
+            }
+        }
         typewriter.refresh()?;
-        // match rx.try_recv() {
-        //     Ok(s) => std::io::stdout().write_all(&s)?,
-        //     Err(mpsc::TryRecvError::Empty) => thread::sleep(Duration::from_millis(100)),
-        //     Err(mpsc::TryRecvError::Disconnected) => {
-        //         break;
-        //     }
-        // }
     }
     cleanup(child);
     Ok(())
@@ -618,19 +698,27 @@ fn cleanup(mut child: Box<dyn Child + Send + Sync>) {
     let _ = child.kill();
     close_random_fds();
     let _ = disable_raw_mode();
-    let _ = stdout().execute(cursor::Show);
+    let _ = crossterm::execute!(stdout(), PopKeyboardEnhancementFlags, cursor::Show);
 }
 
-fn spawn_pty_channel(mut reader: impl BufRead + std::marker::Send + 'static) -> Receiver<[u8; 1]> {
-    let (tx, rx) = mpsc::channel::<[u8; 1]>();
+fn spawn_pty_channel(mut reader: impl BufRead + std::marker::Send + 'static) -> Receiver<String> {
+    let (tx, rx) = mpsc::channel::<String>();
     thread::spawn(move || loop {
-        let mut buffer = [0; 1];
-        if let Err(_) = reader.read_exact(&mut buffer) {
+        let mut buffer = String::new();
+        if let Err(_) = reader.read_line(&mut buffer) {
             break;
         };
-        tx.send(buffer).unwrap();
+        if let Err(_) = tx.send(strip_ansi(&buffer)) {
+            break;
+        }
     });
     rx
+}
+
+fn strip_ansi(text: &str) -> String {
+    // let re = Regex::new(r"\x1b\[[0-9]*[ -/]*m").unwrap();
+    // let sanitized = re.replace_all(text, "");
+    text.trim().to_string()
 }
 
 #[cfg(test)]
@@ -639,10 +727,10 @@ mod tests {
 
     #[test]
     fn test_get_pos() {
-        let t = Typewriter::new(TYPEWRITER_HEIGHT, TYPEWRITER_MAX_WIDTH);
-        assert_eq!(25, t.arms.len());
-        assert_eq!(10, t.get_key_pos(KEYMAPS.get(&'1').unwrap()));
-        assert_eq!(15, t.get_key_pos(KEYMAPS.get(&'0').unwrap()));
+        let t = Typewriter::new(TYPEWRITER_HEIGHT, 180, 180);
+        assert_eq!(46, t.arms.len());
+        // assert_eq!(10, t.get_key_pos(KEYMAPS.get(&'1').unwrap()));
+        // assert_eq!(15, t.get_key_pos(KEYMAPS.get(&'0').unwrap()));
         assert_eq!(0, t.get_key_pos(KEYMAPS.get(&'z').unwrap()));
     }
 }
