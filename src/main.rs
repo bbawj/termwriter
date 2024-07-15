@@ -21,7 +21,6 @@ use crossterm::style::PrintStyledContent;
 use crossterm::style::Stylize;
 use crossterm::terminal::disable_raw_mode;
 use crossterm::terminal::enable_raw_mode;
-use crossterm::terminal::Clear;
 use crossterm::{terminal, QueueableCommand};
 use lazy_static::lazy_static;
 
@@ -35,8 +34,8 @@ enum ArmType {
 #[derive(Clone, Copy)]
 enum State {
     Rest,
-    MoveUp,
-    Strike,
+    MoveUp(char),
+    Strike(char),
     MoveDown,
 }
 
@@ -302,6 +301,8 @@ impl Typewriter {
         for i in 1..typewriter_upper_width {
             typewriter_upper[(upper_space + i) as usize] = HORZ;
         }
+        let mid = width / 2;
+        typewriter_upper[mid as usize] = '^';
 
         let mut typewriter_upper_slants = vec![' '; width.into()];
         SLANTR_3
@@ -325,7 +326,6 @@ impl Typewriter {
 
         let mut canvas = vec![vec![' '; width.into()]; height.into()];
 
-        let mid = width / 2;
         let n_arms = (width / 2).min(N_KEYS as u16);
         let mid_arm = n_arms / 2;
         let mut arms = vec![Arm::default(); n_arms.into()];
@@ -424,10 +424,7 @@ impl Typewriter {
                     self.is_shift_pressed = is_shift_pressed;
 
                     let pos = self.get_key_pos(k);
-                    if self.buffer.len() != self.paper_width.into() {
-                        self.buffer.push(key);
-                    }
-                    self.arms[pos].state = State::MoveUp;
+                    self.arms[pos].state = State::MoveUp(key);
                     self.canvas[k.row][self.key_start + k.col] = '_';
                     self.prev_key = Some(Keys::Key(k));
                 }
@@ -446,6 +443,7 @@ impl Typewriter {
     }
 
     pub fn refresh(&mut self) -> Result<(), anyhow::Error> {
+        self.canvas[0].fill(' ');
         self.canvas[UPPER_ROW].copy_from_slice(&self.typewriter_upper);
         self.canvas[UPPER_SLANTS_ROW].copy_from_slice(&self.typewriter_upper_slants);
         self.canvas[UPPER_BOTTOM_ROW].copy_from_slice(&self.typewriter_upper_bottom);
@@ -453,17 +451,18 @@ impl Typewriter {
         let mut stdout = stdout();
         for line in self.printed_paper.into_iter() {
             // dbg!(line);
-            self.draw_text(line)?;
+            self.draw_text(line, false)?;
         }
-        self.draw_text(&self.buffer)?;
-        stdout.queue(Clear(terminal::ClearType::FromCursorDown))?;
+        stdout.queue(cursor::MoveDown(1))?;
         stdout.queue(Print(&self))?;
-        stdout.queue(cursor::MoveUp(self.height + self.printed_paper.size))?;
+        stdout.queue(cursor::MoveUp(self.height))?;
+        self.draw_text(&self.buffer, true)?;
+        stdout.queue(cursor::MoveUp(self.printed_paper.size + 1))?;
         stdout.flush()?;
         Ok(())
     }
 
-    fn draw_text(&self, text: &str) -> Result<(), anyhow::Error> {
+    fn draw_text(&self, text: &str, print_cursor: bool) -> Result<(), anyhow::Error> {
         let mut stdout = stdout();
         let print_pos = self.mid as usize - self.buffer.len();
         // TODO: how to draw the striking cursor?
@@ -473,6 +472,10 @@ impl Typewriter {
             Print(" ".repeat(print_pos)),
             PrintStyledContent(text.black().on_white()),
         )?;
+        if print_cursor && self.canvas[0][self.mid as usize] != ' ' {
+            // TODO: if no more space on paper, dont draw the white bg
+            crossterm::queue!(stdout, PrintStyledContent('|'.black().on_white()))?;
+        }
         let (col, _) = cursor::position()?;
         crossterm::queue!(
             stdout,
@@ -522,8 +525,13 @@ impl Typewriter {
             }
             arm.state = match arm.state {
                 State::Rest => State::Rest,
-                State::MoveUp => State::Strike,
-                State::Strike => State::MoveDown,
+                State::MoveUp(c) => State::Strike(c),
+                State::Strike(c) => {
+                    if self.buffer.len() != self.paper_width.into() {
+                        self.buffer.push(c);
+                    }
+                    State::MoveDown
+                }
                 State::MoveDown => State::Rest,
             }
         }
@@ -545,7 +553,7 @@ impl Typewriter {
                         col_offset: 0,
                     },
                 ],
-                State::MoveUp | State::MoveDown => vec![
+                State::MoveUp(_) | State::MoveDown => vec![
                     Draw {
                         c: ' ',
                         row_offset: 1,
@@ -562,7 +570,7 @@ impl Typewriter {
                         col_offset: 0,
                     },
                 ],
-                State::Strike => Self::generate_strike_arm(arm.arm_type, flip, diff),
+                State::Strike(_) => Self::generate_strike_arm(arm.arm_type, flip, diff),
             },
             ArmType::T1 => match arm.state {
                 State::Rest => vec![
@@ -577,7 +585,7 @@ impl Typewriter {
                         col_offset: if flip { 1 } else { -1 },
                     },
                 ],
-                State::MoveUp | State::MoveDown => vec![
+                State::MoveUp(_) | State::MoveDown => vec![
                     Draw {
                         c: ' ',
                         row_offset: 1,
@@ -594,7 +602,7 @@ impl Typewriter {
                         col_offset: if flip { 1 } else { -1 },
                     },
                 ],
-                State::Strike => Self::generate_strike_arm(arm.arm_type, flip, diff),
+                State::Strike(_) => Self::generate_strike_arm(arm.arm_type, flip, diff),
             },
             ArmType::T2 => match arm.state {
                 State::Rest => vec![
@@ -609,7 +617,7 @@ impl Typewriter {
                         col_offset: if flip { 1 } else { -1 },
                     },
                 ],
-                State::MoveUp | State::MoveDown => vec![
+                State::MoveUp(_) | State::MoveDown => vec![
                     Draw {
                         c: ' ',
                         row_offset: 1,
@@ -626,7 +634,7 @@ impl Typewriter {
                         col_offset: if flip { 1 } else { -1 },
                     },
                 ],
-                State::Strike => Self::generate_strike_arm(arm.arm_type, flip, diff),
+                State::Strike(_) => Self::generate_strike_arm(arm.arm_type, flip, diff),
             },
         }
     }
@@ -697,7 +705,7 @@ impl Typewriter {
 fn main() -> Result<(), anyhow::Error> {
     let window_size = terminal::window_size()?;
 
-    let mut typewriter = Typewriter::new(TYPEWRITER_HEIGHT, 60, window_size.rows);
+    let mut typewriter = Typewriter::new(TYPEWRITER_HEIGHT, window_size.columns, window_size.rows);
 
     let mut stdout = stdout();
     stdout.queue(PushKeyboardEnhancementFlags(
