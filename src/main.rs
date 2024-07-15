@@ -30,7 +30,6 @@ enum ArmType {
     T0,
     T1,
     T2,
-    T3,
 }
 
 #[derive(Clone, Copy)]
@@ -66,7 +65,6 @@ struct Draw {
 type Canvas = Vec<Vec<char>>;
 
 struct Typewriter {
-    win_height: u16,
     height: u16,
     width: u16,
     paper_width: u16,
@@ -142,6 +140,7 @@ enum Keys {
 }
 
 const SHIFT: char = '\u{1}';
+const ENTER: char = '\u{2}';
 #[rustfmt::skip]
 const QWERTY: [char; N_KEYS] = [
     '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=',
@@ -383,7 +382,6 @@ impl Typewriter {
         canvas[SPACE_ROW][key_start..key_start + 23].copy_from_slice(&SPACE_BAR);
 
         return Box::new(Typewriter {
-            win_height,
             height,
             width,
             paper_width,
@@ -403,6 +401,10 @@ impl Typewriter {
 
     pub fn update_state(&mut self, key: char, is_shift_pressed: bool) {
         match key.to_ascii_lowercase() {
+            ENTER => {
+                self.printed_paper.push(self.buffer.clone());
+                self.buffer.clear();
+            }
             SHIFT => {
                 assert!(false);
                 let k = KEYMAPS.get(&key).unwrap();
@@ -450,7 +452,7 @@ impl Typewriter {
         self.update_arms();
         let mut stdout = stdout();
         for line in self.printed_paper.into_iter() {
-            // dbg!(line, &self.printed_paper);
+            // dbg!(line);
             self.draw_text(line)?;
         }
         self.draw_text(&self.buffer)?;
@@ -626,7 +628,6 @@ impl Typewriter {
                 ],
                 State::Strike => Self::generate_strike_arm(arm.arm_type, flip, diff),
             },
-            ArmType::T3 => todo!(),
         }
     }
 
@@ -679,7 +680,6 @@ impl Typewriter {
                     })
                 }
             }
-            ArmType::T3 => todo!(),
         };
         cmds.push(Draw {
             c: VERT,
@@ -738,6 +738,7 @@ fn main() -> Result<(), anyhow::Error> {
                         writeln!(writer, "{}", typewriter.buffer)?;
                         // dbg!("test");
                         writer.flush()?;
+                        typewriter.update_state(ENTER, false);
                         // written = true;
                     }
                     event::KeyCode::Tab => todo!(),
@@ -764,7 +765,8 @@ fn main() -> Result<(), anyhow::Error> {
         match rx.try_recv() {
             Ok(s) => {
                 // dbg!(&s);
-                s.as_bytes()
+                s.trim()
+                    .as_bytes()
                     .chunks(typewriter.paper_width.into())
                     .for_each(|c| {
                         typewriter
