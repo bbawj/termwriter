@@ -21,6 +21,9 @@ use crossterm::style::PrintStyledContent;
 use crossterm::style::Stylize;
 use crossterm::terminal::disable_raw_mode;
 use crossterm::terminal::enable_raw_mode;
+use crossterm::terminal::Clear;
+use crossterm::terminal::ClearType;
+use crossterm::ExecutableCommand;
 use crossterm::{terminal, QueueableCommand};
 use lazy_static::lazy_static;
 
@@ -465,7 +468,6 @@ impl Typewriter {
     fn draw_text(&self, text: &str, print_cursor: bool) -> Result<(), anyhow::Error> {
         let mut stdout = stdout();
         let print_pos = self.mid as usize - self.buffer.len();
-        // TODO: how to draw the striking cursor?
         crossterm::queue!(
             stdout,
             cursor::Hide,
@@ -473,19 +475,17 @@ impl Typewriter {
             PrintStyledContent(text.black().on_white()),
         )?;
         if print_cursor && self.canvas[0][self.mid as usize] != ' ' {
-            // TODO: if no more space on paper, dont draw the white bg
-            crossterm::queue!(stdout, PrintStyledContent('|'.black().on_white()))?;
+            if self.buffer.len() == self.paper_width.into() {
+                crossterm::queue!(stdout, PrintStyledContent('|'.white()))?;
+            } else {
+                crossterm::queue!(stdout, PrintStyledContent('|'.black().on_white()))?;
+            }
         }
-        let (col, _) = cursor::position()?;
         crossterm::queue!(
             stdout,
             PrintStyledContent(
-                " ".repeat(
-                    (print_pos + self.paper_width as usize)
-                        .checked_sub(col.into())
-                        .unwrap_or(0)
-                )
-                .on_white()
+                " ".repeat(self.paper_width as usize - text.len())
+                    .on_white()
             ),
             terminal::Clear(terminal::ClearType::UntilNewLine),
             Print("\r\n"),
@@ -494,7 +494,6 @@ impl Typewriter {
     }
 
     fn get_key_pos(&self, key: &Key) -> usize {
-        // let spacing = self.width as usize / 2 - KEYS_PER_ROW;
         let mid_arm = self.arms.len() / 2;
         let lerp = self.arms.len() as f32 / N_KEYS as f32;
         let offset = (lerp
@@ -717,20 +716,17 @@ fn main() -> Result<(), anyhow::Error> {
     stdout.queue(cursor::Hide)?;
     typewriter.refresh()?;
 
+    // TODO: get default shell
     let mut child = Command::new("sh")
         .stdout(Stdio::piped())
         .stdin(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()?;
 
-    // Read and parse output from the pty with reader
-    // let reader = BufReader::new(pair.master.try_clone_reader()?);
     let reader = BufReader::new(child.stdout.take().unwrap());
 
-    // Send data to the pty by writing to the master
-    // let mut writer = pair.master.take_writer()?;
     let mut writer = child.stdin.take().unwrap();
-    let rx = spawn_pty_channel(reader);
-    // let mut written = false;
+    let rx = spawn_proc_channel(reader);
     enable_raw_mode()?;
     loop {
         typewriter.unset_prev_key();
@@ -744,12 +740,9 @@ fn main() -> Result<(), anyhow::Error> {
                     }
                     event::KeyCode::Enter => {
                         writeln!(writer, "{}", typewriter.buffer)?;
-                        // dbg!("test");
                         writer.flush()?;
                         typewriter.update_state(ENTER, false);
-                        // written = true;
                     }
-                    event::KeyCode::Tab => todo!(),
                     event::KeyCode::Char(c) => {
                         if c == 'c' && e.modifiers.contains(event::KeyModifiers::CONTROL) {
                             break;
@@ -757,7 +750,6 @@ fn main() -> Result<(), anyhow::Error> {
                         typewriter
                             .update_state(c, e.modifiers.contains(event::KeyModifiers::SHIFT));
                     }
-                    event::KeyCode::Esc => todo!(),
                     event::KeyCode::CapsLock => todo!(),
                     event::KeyCode::Modifier(m) => {
                         if m == event::ModifierKeyCode::LeftShift {
@@ -766,6 +758,10 @@ fn main() -> Result<(), anyhow::Error> {
                     }
                     _ => continue,
                 },
+                event::Event::Resize(col, row) => {
+                    stdout.execute(Clear(ClearType::All))?;
+                    typewriter = Typewriter::new(TYPEWRITER_HEIGHT, col, row);
+                }
                 _ => todo!(),
             };
         }
@@ -802,7 +798,7 @@ fn cleanup(mut child: Child) {
     let _ = crossterm::execute!(stdout(), PopKeyboardEnhancementFlags, cursor::Show);
 }
 
-fn spawn_pty_channel(mut reader: impl BufRead + std::marker::Send + 'static) -> Receiver<String> {
+fn spawn_proc_channel(mut reader: impl BufRead + std::marker::Send + 'static) -> Receiver<String> {
     let (tx, rx) = mpsc::channel::<String>();
     thread::spawn(move || loop {
         let mut buffer = String::new();
